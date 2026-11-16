@@ -742,9 +742,14 @@ class BaseInputOption(BaseOption):
             data_to_redact.append(value)
 
         data_to_redact += [
-            urllib.parse.quote(data)
+            escaped
             for data in data_to_redact
-            if urllib.parse.quote(data) != data
+            for escaped in {
+                urllib.parse.quote(data),
+                urllib.parse.quote(data, safe=""),
+                urllib.parse.quote_plus(data),
+            }
+            if escaped != data
         ]
 
         for operation_logger in OperationLogger._instances:

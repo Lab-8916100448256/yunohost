@@ -401,6 +401,14 @@
     type = "string"
     redact = true
     
+[lebureau]
+    [lebureau.auth_token]
+    type = "password"
+    ask.en = "Le Bureau TSIG token"
+    ask.fr = "Jeton TSIG Le Bureau"
+    help.en = "Use algorithm:key_name:base64_secret from your Le Bureau TSIG key. The key must allow both zone transfers (AXFR) and DNS updates."
+    help.fr = "Utilisez algorithm:key_name:base64_secret avec votre clé TSIG Le Bureau. La clé doit autoriser les transferts de zone (AXFR) et les mises à jour DNS."
+
 [linode]
     [linode.auth_token]
     type = "string"

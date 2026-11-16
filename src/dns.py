@@ -18,6 +18,8 @@
 # along with this program. If not, see <http://www.gnu.org/licenses/>.
 #
 
+import hashlib
+import json
 import os
 import re
 import time
@@ -105,7 +107,7 @@ def domain_dns_suggest(domain: str) -> str:
 
 class DNSRecord(TypedDict):
     name: str
-    type: Literal["A", "AAAA", "MX", "TXT", "SRV", "CAA"]
+    type: Literal["A", "AAAA", "MX", "TXT", "CNAME", "SRV", "CAA"]
     ttl: int
     content: str | None
     current: NotRequired[str | list[str] | None]
@@ -113,6 +115,7 @@ class DNSRecord(TypedDict):
     managed_by_yunohost: NotRequired[bool]
     id: NotRequired[Any]
     identifier: NotRequired[Any]
+    options: NotRequired[dict[str, dict[str, Any]]]
     action: NotRequired[Literal["delete", "create", "update", "unchanged"]]
 
 
@@ -469,9 +472,15 @@ def _get_relative_name_for_dns_zone(domain, base_dns_zone):
     )
 
 
-def _get_registrar_config_section(domain: str) -> OrderedDict[str, Any]:
-    from lexicon.providers.auto import _relevant_provider_for_domain
+def _get_registrar_for_domain(domain: str) -> str:
+    # Lexicon has no public credential-free discovery API. Keep this private
+    # dependency here, without importing the deprecated providers namespace.
+    from lexicon._private.providers.auto import _relevant_provider_for_domain
 
+    return _relevant_provider_for_domain(domain)[0]
+
+
+def _get_registrar_config_section(domain: str) -> OrderedDict[str, Any]:
     registrar_infos = OrderedDict(
         {
             "name": m18n.n(
@@ -534,7 +543,7 @@ def _get_registrar_config_section(domain: str) -> OrderedDict[str, Any]:
         return registrar_infos
 
     try:
-        registrar = _relevant_provider_for_domain(dns_zone)[0]
+        registrar = _get_registrar_for_domain(dns_zone)
     except ValueError:
         registrar_infos["registrar"]["default"] = None
         registrar_infos["infos"]["ask"] = m18n.n("domain_dns_registrar_not_supported")
@@ -677,6 +686,8 @@ def domain_dns_push(
             # Make sure the content is also a FQDN (with trailing . ?)
             if content == "@" and record["type"] == "CNAME":
                 content = base_dns_zone + "."
+            if type_ == "TXT" and content is not None:
+                content = _normalize_txt_content(content)
 
             wanted_records.append(
                 {"name": name, "type": type_, "ttl": record["ttl"], "content": content}
@@ -698,6 +709,8 @@ def domain_dns_push(
     base_config = {
         "provider_name": registrar,
         "domain": base_dns_zone,
+        # Keep YunoHost's discovered authoritative zone intact in Lexicon.
+        "delegated": base_dns_zone,
         registrar: registrar_credentials,
     }
 
@@ -706,15 +719,10 @@ def domain_dns_push(
     current_records = []
 
     for rtype in relevant_types:
-        query = (
-            LexiconConfigResolver()
-            .with_dict(dict_object=base_config)
-            .with_dict(dict_object={"action": "list", "type": rtype})
-        )
-        client = LexiconClient(query)
-
+        query = LexiconConfigResolver().with_dict(dict_object=base_config)
         try:
-            current_records.extend(client.execute())
+            with LexiconClient(query) as client:
+                current_records.extend(client.list_records(rtype))
         except Exception as e:
             raise YunohostError("domain_dns_push_failed_to_list", error=str(e))
 
@@ -732,20 +740,30 @@ def domain_dns_push(
         # Try to get rid of weird stuff like ".domain.tld" or "@.domain.tld"
         record["name"] = record["name"].strip("@").strip(".")
 
-        # Some API return '@' in content and we shall convert it to absolute/fqdn
-        record["content"] = (
-            record["content"]
-            .replace("@.", base_dns_zone + ".")
-            .replace("@", base_dns_zone + ".")
-        )
+        # Expand symbolic hostname targets, without changing literal TXT values.
+        if record["type"] in ["CNAME", "MX", "SRV"]:
+            record["content"] = re.sub(
+                r"(?<!\S)@\.?(?=$|\s)", base_dns_zone + ".", record["content"]
+            )
 
         if record["type"] == "TXT":
             record["content"] = _normalize_txt_content(record["content"])
+        elif record["type"] == "MX":
+            record["content"] = _normalize_mx_content(
+                record["content"], record.get("options", {})
+            )
 
         # Check if this record was previously set by YunoHost
         record["managed_by_yunohost"] = (
             _hash_dns_record(record) in managed_dns_records_hashes
+            or _legacy_hash_dns_record(record) in managed_dns_records_hashes
         )
+
+    # Capture ownership before the diff mutates update candidates. Retain failed
+    # operations and unchanged siblings; only confirmed writes change ownership.
+    new_managed_dns_records_hashes = {
+        _hash_dns_record(r) for r in current_records if r["managed_by_yunohost"]
+    }
 
     # Step 0 : Get the list of unique (type, name)
     # And compare the current and wanted records
@@ -787,6 +805,15 @@ def domain_dns_push(
         wanted_contents = [r["content"] for r in cwrecords["wanted"]]
         current_contents = [r["content"] for r in cwrecords["current"]]
 
+        unchanged = [r for r in cwrecords["current"] if r["content"] in wanted_contents]
+        changes["unchanged"].extend(unchanged)
+        if force:
+            # Explicit force also adopts existing records matching the desired
+            # configuration, allowing recovery from old process-dependent hashes.
+            new_managed_dns_records_hashes.update(
+                _hash_dns_record(r) for r in unchanged
+            )
+
         current = [
             r for r in cwrecords["current"] if r["content"] not in wanted_contents
         ]
@@ -800,7 +827,6 @@ def domain_dns_push(
         #
         if len(current) == 0 and len(wanted) == 0:
             # No diff, nothing to do
-            changes["unchanged"].extend(cwrecords["current"])
             continue
 
         elif len(wanted) == 0:
@@ -923,6 +949,10 @@ def domain_dns_push(
     progress = Progress(len(changes["delete"] + changes["create"] + changes["update"]))
 
     if progress.total == 0:
+        if new_managed_dns_records_hashes != set(managed_dns_records_hashes):
+            _set_managed_dns_records_hashes(
+                domain, sorted(new_managed_dns_records_hashes)
+            )
         logger.success(m18n.n("domain_dns_push_already_up_to_date"))
         return {}
 
@@ -933,7 +963,6 @@ def domain_dns_push(
     operation_logger.start()
     logger.info(m18n.n("domain_dns_pushing"))
 
-    new_managed_dns_records_hashes = [_hash_dns_record(r) for r in changes["unchanged"]]
     results: dict[Literal["warnings", "errors"], list[str]] = {
         "warnings": [],
         "errors": [],
@@ -941,6 +970,11 @@ def domain_dns_push(
 
     for action in ["delete", "create", "update"]:  # type: ignore[assignment]
         for record in changes[action]:
+            # Hash the canonical owner, before provider-specific name rewrites.
+            new_hash = _hash_dns_record(record)
+            old_hash = _hash_dns_record(
+                {**record, "content": record.get("old_content", record["content"])}
+            )
             relative_name = _get_relative_name_for_dns_zone(
                 record["name"], base_dns_zone
             )
@@ -969,15 +1003,32 @@ def domain_dns_push(
                 if record["name"] == base_dns_zone:
                     record["name"] = "@." + record["name"]
 
-            record["action"] = action
             query = (
                 LexiconConfigResolver()
                 .with_dict(dict_object=base_config)
-                .with_dict(dict_object=record)
+                .with_dict(dict_object={"ttl": record["ttl"]})
             )
 
             try:
-                result = LexiconClient(query).execute()
+                with LexiconClient(query) as client:
+                    if action == "create":
+                        result = client.create_record(
+                            record["type"], record["name"], cast(str, record["content"])
+                        )
+                    elif action == "update":
+                        result = client.update_record(
+                            identifier=record.get("identifier"),
+                            rtype=record["type"],
+                            name=record["name"],
+                            content=record["content"],
+                        )
+                    else:
+                        result = client.delete_record(
+                            identifier=record.get("identifier"),
+                            rtype=record["type"],
+                            name=record["name"],
+                            content=record["content"],
+                        )
             except Exception as e:
                 msg = m18n.n(
                     "domain_dns_push_record_failed",
@@ -990,7 +1041,9 @@ def domain_dns_push(
                 results["errors"].append(msg)
             else:
                 if result:
-                    new_managed_dns_records_hashes.append(_hash_dns_record(record))
+                    new_managed_dns_records_hashes.discard(old_hash)
+                    if action != "delete":
+                        new_managed_dns_records_hashes.add(new_hash)
                 else:
                     msg = m18n.n(
                         "domain_dns_push_record_failed",
@@ -1002,7 +1055,7 @@ def domain_dns_push(
                     logger.error(msg)
                     results["errors"].append(msg)
 
-    _set_managed_dns_records_hashes(domain, new_managed_dns_records_hashes)
+    _set_managed_dns_records_hashes(domain, sorted(new_managed_dns_records_hashes))
 
     # Everything succeeded
     if len(results["errors"]) + len(results["warnings"]) == 0:
@@ -1044,7 +1097,31 @@ def _normalize_txt_content(content: str) -> str:
     return content
 
 
-def _hash_dns_record(record: DNSRecord) -> int:
+def _normalize_mx_content(content: str, options: dict[str, dict[str, Any]]) -> str:
+    # Some providers return the exchange separately from its preference. Keep
+    # full presentation values from other providers intact, including priority 0.
+    priority = options.get("mx", {}).get("priority")
+    if len(content.split()) == 1 and priority is not None:
+        return f"{int(priority)} {content}"
+    return content
+
+
+def _hash_dns_record(record: DNSRecord) -> str:
+    # Persisted ownership must survive CLI processes and API restarts. A prefix
+    # distinguishes the stable format from old, randomized Python integer hashes.
+    fields = [record.get(f) for f in ["name", "type", "content"]]
+    return (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(fields, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+        ).hexdigest()
+    )
+
+
+def _legacy_hash_dns_record(record: DNSRecord) -> int:
+    # Migrate only entries that still match this process's old hash. Unmatched
+    # legacy entries cannot safely establish ownership; use a reviewed forced
+    # push to explicitly adopt the desired records instead.
     fields = ["name", "type", "content"]
     record_ = {f: record.get(f) for f in fields}
 
